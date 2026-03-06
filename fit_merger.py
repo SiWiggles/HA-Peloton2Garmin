@@ -1,0 +1,235 @@
+import json
+import pandas as pd
+import datetime
+from typing import List, Optional
+from fit_tool.fit_file import FitFile
+from fit_tool.fit_file_builder import FitFileBuilder
+from fit_tool.profile.messages.record_message import RecordMessage
+from fit_tool.profile.messages.session_message import SessionMessage
+
+class FitMerger:
+    def __init__(self, garmin_fit_path: str, peloton_json_path: str):
+        self.garmin_fit_path = garmin_fit_path
+        self.peloton_json_path = peloton_json_path
+        self.garmin_fit: Optional[FitFile] = None
+        self.peloton_df: Optional[pd.DataFrame] = None
+        self.merged_records_df: Optional[pd.DataFrame] = None
+
+    def load_data(self):
+        """Loads both Garmin FIT file and Peloton JSON data."""
+        # 1. Load Garmin FIT
+        print(f"Loading Garmin FIT file from {self.garmin_fit_path}...")
+        self.garmin_fit = FitFile.from_file(self.garmin_fit_path)
+
+        # 2. Load Peloton JSON
+        print(f"Loading Peloton JSON from {self.peloton_json_path}...")
+        with open(self.peloton_json_path, 'r') as f:
+            peloton_data = json.load(f)
+
+        if isinstance(peloton_data, dict) and 'metrics' in peloton_data and 'seconds_since_pedaling_start' in peloton_data:
+            seconds = peloton_data.get('seconds_since_pedaling_start', [])
+            records_dict = {'seconds': seconds}
+
+            for metric in peloton_data.get('metrics', []):
+                slug = metric.get('slug')
+                values = metric.get('values', [])
+
+                if len(values) < len(seconds):
+                    values.extend([None] * (len(seconds) - len(values)))
+                elif len(values) > len(seconds):
+                    values = values[:len(seconds)]
+
+                records_dict[slug] = values
+
+            self.peloton_df = pd.DataFrame(records_dict)
+
+            rename_map = {'output': 'power'}
+            self.peloton_df.rename(columns=rename_map, inplace=True)
+
+        elif isinstance(peloton_data, list):
+            self.peloton_df = pd.DataFrame(peloton_data)
+            if 'timestamp' in self.peloton_df.columns:
+                if pd.api.types.is_numeric_dtype(self.peloton_df['timestamp']):
+                    self.peloton_df['datetime'] = pd.to_datetime(self.peloton_df['timestamp'], unit='s', utc=True)
+                else:
+                    self.peloton_df['datetime'] = pd.to_datetime(self.peloton_df['timestamp'], utc=True)
+                self.peloton_df['datetime'] = self.peloton_df['datetime'].dt.tz_localize(None)
+                self.peloton_df = self.peloton_df.sort_values('datetime').reset_index(drop=True)
+        else:
+            raise ValueError("Unsupported Peloton JSON format")
+
+    def align_timeseries(self):
+        """Extracts Garmin records, aligns with Peloton."""
+        print("Extracting Garmin records for alignment...")
+        garmin_records = []
+        first_garmin_timestamp = None
+
+        for record in self.garmin_fit.records:
+            msg = record.message
+            if isinstance(msg, RecordMessage):
+                if first_garmin_timestamp is None:
+                    first_garmin_timestamp = msg.timestamp
+
+                dt = datetime.datetime.fromtimestamp(msg.timestamp / 1000.0)
+                # Calculate elapsed seconds to match Peloton's 'seconds'
+                elapsed_seconds = (msg.timestamp - first_garmin_timestamp) / 1000.0
+
+                garmin_records.append({
+                    'timestamp_ms': msg.timestamp,
+                    'datetime': dt,
+                    'seconds': elapsed_seconds,
+                    'heart_rate': msg.heart_rate
+                })
+
+        if not garmin_records:
+            print("No RecordMessages found in Garmin file.")
+            self.merged_records_df = pd.DataFrame()
+            return
+
+        garmin_df = pd.DataFrame(garmin_records)
+        garmin_df = garmin_df.sort_values('seconds').reset_index(drop=True)
+
+        print("Aligning time-series...")
+        if 'seconds' in self.peloton_df.columns:
+            # Merge on elapsed 'seconds' (Peloton native array)
+            self.peloton_df['seconds'] = self.peloton_df['seconds'].astype(float)
+            # Both need to be sorted by seconds
+            self.peloton_df = self.peloton_df.sort_values('seconds').reset_index(drop=True)
+            self.merged_records_df = pd.merge_asof(
+                garmin_df,
+                self.peloton_df,
+                on='seconds',
+                direction='nearest',
+                tolerance=2.0  # Peloton outputs every 1-50 sec? Wait, 50sec chunks?!
+                               # Look at the data: 0, 50, 100... but wait, maybe tolerance shouldn't be 2.0.
+                               # Actually let's just forward-fill or back-fill because peloton chunks are large.
+                               # Actually, no tolerance or a large tolerance like 55s since chunks are 50s.
+            )
+        else:
+            garmin_df['datetime'] = pd.to_datetime(garmin_df['datetime'])
+            self.peloton_df['datetime'] = pd.to_datetime(self.peloton_df['datetime'])
+            garmin_df['datetime'] = garmin_df['datetime'].astype('datetime64[ns]')
+            self.peloton_df['datetime'] = self.peloton_df['datetime'].astype('datetime64[ns]')
+
+            self.merged_records_df = pd.merge_asof(
+                garmin_df,
+                self.peloton_df,
+                on='datetime',
+                direction='nearest',
+                tolerance=pd.Timedelta(seconds=55)
+            )
+
+        self.merged_records_df.set_index('timestamp_ms', inplace=True)
+
+    def merge_and_export(self, output_path: str):
+        if self.merged_records_df is None:
+            raise RuntimeError("Must call align_timeseries before merge_and_export")
+
+        print("Rebuilding merged FIT file...")
+        builder = FitFileBuilder()
+
+        total_distance = 0.0
+        max_power = 0
+        power_sum = 0
+        power_count = 0
+        max_cadence = 0
+        cadence_sum = 0
+        cadence_count = 0
+        max_speed = 0.0
+        speed_sum = 0.0
+        speed_count = 0
+
+        for record in self.garmin_fit.records:
+            msg = record.message
+
+            if isinstance(msg, RecordMessage):
+                new_msg = RecordMessage()
+
+                for field in msg.fields:
+                    try:
+                        if field.name == 'timestamp': new_msg.timestamp = msg.timestamp
+                        elif field.name == 'heart_rate': new_msg.heart_rate = msg.heart_rate
+                    except Exception:
+                        pass
+
+                if msg.timestamp in self.merged_records_df.index:
+                    row = self.merged_records_df.loc[msg.timestamp]
+
+                    if pd.notna(row.get('power')):
+                        val = int(row['power'])
+                        new_msg.power = val
+                        max_power = max(max_power, val)
+                        power_sum += val
+                        power_count += 1
+
+                    if pd.notna(row.get('cadence')):
+                        val = int(row['cadence'])
+                        new_msg.cadence = val
+                        max_cadence = max(max_cadence, val)
+                        cadence_sum += val
+                        cadence_count += 1
+
+                    if pd.notna(row.get('speed')):
+                        val = float(row['speed'])
+                        new_msg.speed = val
+                        max_speed = max(max_speed, val)
+                        speed_sum += val
+                        speed_count += 1
+
+                    if 'distance' in row and pd.notna(row.get('distance')):
+                        # Note: peloton distance in JSON is typically cumulative km or miles?
+                        # FIT expects distance in meters (usually cumulative)
+                        val = float(row['distance']) * 1000.0  # Assumes km -> meters
+                        new_msg.distance = val
+                        total_distance = max(total_distance, val)
+
+                builder.add(new_msg)
+
+            elif isinstance(msg, SessionMessage):
+                new_msg = SessionMessage()
+                for field in msg.fields:
+                    try:
+                        if field.name == 'timestamp': new_msg.timestamp = msg.timestamp
+                        elif field.name == 'start_time': new_msg.start_time = msg.start_time
+                    except Exception:
+                        pass
+
+                new_msg.total_distance = total_distance
+
+                if power_count > 0:
+                    new_msg.avg_power = int(power_sum / power_count)
+                    new_msg.max_power = max_power
+
+                if cadence_count > 0:
+                    new_msg.avg_cadence = int(cadence_sum / cadence_count)
+                    new_msg.max_cadence = max_cadence
+
+                if speed_count > 0:
+                    new_msg.avg_speed = speed_sum / speed_count
+                    new_msg.max_speed = max_speed
+
+                builder.add(new_msg)
+            else:
+                builder.add(msg)
+
+        merged_fit = builder.build()
+        merged_fit.to_file(output_path)
+        print(f"Successfully exported merged file to {output_path}")
+
+if __name__ == '__main__':
+    merger = FitMerger("test_data/22040571319_ACTIVITY.fit", "test_data/test_performance.json")
+    merger.load_data()
+
+    # Check peloton resolution
+    print("Peloton seconds array:")
+    print(merger.peloton_df['seconds'].head(10))
+
+    # Tweak the alignment logic for 50s chunks if necessary:
+    merger.align_timeseries()
+    print("Alignment sample:")
+    cols = ['seconds', 'power', 'cadence', 'speed']
+    if 'distance' in merger.merged_records_df.columns:
+        cols.append('distance')
+    print(merger.merged_records_df[cols].head(10))
+
+    merger.merge_and_export("test_data/merged_output.fit")
